@@ -11,6 +11,7 @@ A simple HTTP server for single-user webapps.
 import socket
 import threading
 import time
+import re
 
 class Socket_Thread(threading.Thread):
     """
@@ -99,10 +100,14 @@ class Socket_Thread(threading.Thread):
         data = "HTTP/1.1 {code}\r\n".format(code=code)
         content_len = 0
         if content:
-            data += "Content-Type: {content_type}\r\n".format(
-                        content_type = content['type'],
-                     )
-            content_len = len(content['data'])
+            if content.has_key('etag'):
+                data += 'ETag: "{etag}"\r\n'.format(etag=content['etag'])
+
+            if content.has_key('data'):
+                data += "Content-Type: {content_type}\r\n".format(
+                            content_type = content['type'],
+                         )
+                content_len = len(content['data'])
 
         data += "Content-Length: {content_len}\r\n"\
                 "Connection: {keep}\r\n"\
@@ -110,7 +115,7 @@ class Socket_Thread(threading.Thread):
                      content_len = content_len,
                      keep = 'keep-alive' if alive else 'close',
                  )
-        if content:
+        if content.has_key('data'):
             data += content['data']
 
         went = 0
@@ -120,7 +125,7 @@ class Socket_Thread(threading.Thread):
                 raise IOError('Broken socket')
             went += sent
 #------------------------------------------------------------------------------
-    def file_serv(self, uri, etag):
+    def file_serv(self, uri, etags):
         """
         Serve a file
 
@@ -129,23 +134,45 @@ class Socket_Thread(threading.Thread):
         TODO: Cacheing
 
         """
+        desc = []
         try:
-            desc = self.server.files[uri]
+            with self.server.lck_files:  # LOCK
+                desc[:] = self.server.files[uri]
         except KeyError:
+            print " "*16,
+            print '404: uri={}'.format(uri)
             return '404 Not Found', {}
+
+        if len(desc) == 3:
+            desc.append(None)
+        else:
+            if etags is not None and etags != '*':
+                etags = etags.split(',')
+                for etag in etags:
+                    ma = re.match(r'^"((?:[^"]|\\.)*)"$', etag.strip())
+                    if ma and ma.group(1) == desc[3]:
+                        print " "*16,
+                        print '304: etag={}'.format(desc[3])
+                        return '304 Not Modified', {
+                            'etag': desc[3],
+                        }
 
         f = open(desc[0], 'rb')
         data = f.read()
         f.close()
 
+        print " "*16,
+        print '200: etag={}'.format(desc[3])
+
         return '200 OK', {
             'type': desc[1],
+            'etag': desc[3],
             'data': data,
         }
 #------------------------------------------------------------------------------
     def run(self):
 
-        print "{: <20}".format(time.time() % 86400),
+        print "{: <16}".format(time.time() % 86400),
         print '--> {}'.format(self.name)
 
         alive = True
@@ -162,14 +189,18 @@ class Socket_Thread(threading.Thread):
             except KeyError:
                 alive = False
 
-            print "{: <20}".format(time.time() % 86400),
+            print "{: <16}".format(time.time() % 86400),
             print self.name, self.s.getpeername()[0], mode, uri,
             print "keep-alive" if alive else "close"
+            print " "*16, "etag={}".format(fields.get('if-none-match', None))
 
             # ------ build a response --------
 
             # TODO: this is a stub code
-            code, content = self.file_serv(uri, None)
+            code, content = self.file_serv(
+                                    uri,
+                                    fields.get('if-none-match', None),
+                                )
 
             # ------ write to ----------------
 
@@ -187,7 +218,7 @@ class Socket_Thread(threading.Thread):
             exc = True
         self.s.close()
 
-        print "{: <20}".format(time.time() % 86400),
+        print "{: <16}".format(time.time() % 86400),
         print '<-- {}: {} {}'.format(
                 self.name,
                 'broken' if alive else 'clean',
@@ -195,20 +226,30 @@ class Socket_Thread(threading.Thread):
             )
 #------------------------------------------------------------------------------
 class App_Server(object):
-    def __init__(self, host, port, maxsrvsocks=5):
+    def __init__(self, host, port, directory, maxsrvsocks=5):
         self.host = host
         self.port = port
+        self.directory = directory
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.bind((host, port))
         self.server_socket.listen(maxsrvsocks)
 
-        # TODO: a stub code - this MUST be read from a file
-        self.files = {
-            '/':            ['./main.html', 'text/html', None, None],
-            '/favicon.ico': ['./fav.png', 'image/png', None, None],
-            '/kotek':       ['./kotek.png', 'inage/png', None, None],
-        }
+        self.lck_files = threading.Lock()
+        self.load_directory()
 
+#------------------------------------------------------------------------------
+    def load_directory(self):
+        with open(self.directory, 'rb') as f:
+            lines = f.readlines()
+
+            with self.lck_files:  # LOCK
+                self.files = {}
+                for line in lines:
+                    if line[0] == '/':
+                        split_line = line.split()
+                        self.files[split_line[0]] = split_line[1:]
+                        # TODO: many exception possible here
+#------------------------------------------------------------------------------
     def mainloop(self):
         while True:
             (peer_socket, adr) = self.server_socket.accept()
@@ -216,5 +257,5 @@ class App_Server(object):
             thread.start()
 #------------------------------------------------------------------------------
 if __name__ == '__main__':
-    App_Server('', 7007).mainloop()
+    App_Server('', 7007, './directory').mainloop()
 
